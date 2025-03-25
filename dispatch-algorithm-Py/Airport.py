@@ -885,20 +885,52 @@ class operate_on_airline_list(BaseFrame):
         if missing:
             self.show_message(f"请填写: {', '.join(missing)}", "错误", wx.ICON_ERROR)
             return
-        if self.operate=="新增航空公司":
-            if inputs["航司名称"] not in self.cargo_mgr.airline_list:
-                self.cargo_mgr.airline_list.append(inputs["航司名称"])
+            
+        airline_name = inputs["航司名称"]
+        
+        with self.cargo_mgr.db.db_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                if self.operate == "新增航空公司":
+                    if airline_name in self.cargo_mgr.airline_list:
+                        self.show_message("航空公司已存在！", "提示")
+                        return
+                        
+                    # 插入数据库
+                    row_idx = len(self.cargo_mgr.airline_row_mapping)
+                    cursor.execute("INSERT INTO airlines VALUES (?,?)", 
+                                 (airline_name, row_idx))
+                    # 更新内存数据
+                    self.cargo_mgr.airline_list.append(airline_name)
+                    self.cargo_mgr.airline_row_mapping[airline_name] = row_idx
+                    self.cargo_mgr.airline_shelves[airline_name] = Shelf()
+                    
+                else:  # 删除操作
+                    # 直接查询数据库判断航空公司是否存在
+                    cursor.execute("SELECT row_index FROM airlines WHERE name=?", (airline_name,))
+                    if not cursor.fetchone():
+                        self.show_message("航空公司不存在！", "提示")
+                        return
+                    
+                    # 执行数据库删除
+                    cursor.execute("DELETE FROM airlines WHERE name=?", (airline_name,))
+                    
+                    # 强制更新内存数据（无论是否存在都尝试删除）
+                    try:
+                        self.cargo_mgr.airline_list.remove(airline_name)
+                    except ValueError:
+                        pass
+                    if airline_name in self.cargo_mgr.airline_row_mapping:
+                        del self.cargo_mgr.airline_row_mapping[airline_name]
+                    if airline_name in self.cargo_mgr.airline_shelves:
+                        del self.cargo_mgr.airline_shelves[airline_name]
+                    
+                conn.commit()
                 self.show_message("修改成功", "提示")
                 self.Close()
-            else :
-                self.show_message("航空公司已存在！", "提示")
-        else:
-            if inputs["航司名称"] not in self.cargo_mgr.airline_list:
-                self.show_message("航空公司不存在！", "提示")
-            else :
-                self.cargo_mgr.airline_list.remove(inputs["航司名称"])
-                self.show_message("修改成功", "提示")
-                self.Close()
+                
+            except sqlite3.IntegrityError as e:
+                self.show_message(f"数据库操作失败: {str(e)}", "错误", wx.ICON_ERROR)
 
 class InventoryOutFrame(BaseFrame):
     def __init__(self, parent):
