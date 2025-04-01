@@ -32,6 +32,9 @@ class DatabaseManager:
         with self.db_connection() as conn:
             cursor = conn.cursor()
             # Create tables
+            cursor.execute('''CREATE TABLE IF NOT EXISTS agv (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            position INTEGER NOT NULL)''')
             cursor.execute('''CREATE TABLE IF NOT EXISTS cargo (
                             id TEXT PRIMARY KEY,
                             airline TEXT,
@@ -45,10 +48,15 @@ class DatabaseManager:
 
 
 class Shelf:
-    def __init__(self, config=ShelfConfig()):
+    def __init__(self, config=ShelfConfig(), max_weight=MAX_WEIGHT):
         self.config = config
+        self.max_weight = max_weight
         self.storage = np.zeros((config.rows, config.columns, config.layers), dtype=int)
-
+    def is_layer_full(self, z):
+        """修正层满判断逻辑（原代码只检查了第一列）"""
+        return all(self.storage[x, y, z] != 0 
+                 for x in range(self.config.rows)
+                 for y in range(self.config.columns))  # 增加y轴遍历
     def validate_position(self, x, y, z):
         if not (0 <= x < self.config.rows and
                 0 <= y < self.config.columns and
@@ -64,10 +72,14 @@ class Shelf:
         self.storage[x, y, z] = value
 
     def find_available_position(self):
+        """修正列坐标遍历逻辑"""
         for z in range(self.config.layers):
-            for x in range(self.config.rows):
-                if self.storage[x, 0, z] == 0:
-                    return (x, 0, z)
+            if not self.is_layer_full(z):
+                # 修改点：遍历所有列（原代码固定为0列）
+                for y in range(self.config.columns):
+                    for x in range(self.config.rows):
+                        if self.get_position_status(x, y, z) == 0:
+                            return (x, y, z)
         return None
 
 
@@ -89,7 +101,7 @@ class CargoManager:
             conn.execute('''CREATE TABLE IF NOT EXISTS cargo (
                             id TEXT PRIMARY KEY,
                             airline TEXT,
-                            time TEXT,
+                            timestamp TEXT,
                             weight INTEGER,
                             position TEXT)''')
             conn.commit()
@@ -111,7 +123,14 @@ class CargoManager:
                 cursor.execute("SELECT name, row_index FROM airlines")
                 for airline, row_idx in cursor.fetchall():
                     self.airline_row_mapping[airline] = row_idx
-                    self.airline_shelves[airline] = Shelf()
+                    shelf = Shelf()
+                    self.airline_shelves[airline] = shelf
+                    
+                    # 新增：加载已有货物位置到货架
+                    cursor.execute("SELECT position FROM cargo WHERE airline=?", (airline,))
+                    for (pos_str,) in cursor.fetchall():
+                        x, _, z = map(int, pos_str.split('-'))
+                        shelf.modify_position(x, 0, z, 1)  # 标记已占用的位置
 
     def get_airline_shelf(self, airline):
         if airline not in self.airline_shelves:
@@ -174,8 +193,163 @@ class MainFrame(BaseFrame):
     def on_inventory_out(self, event): InventoryOutFrame(self).Show()
 
     def on_settings(self, event): SettingsFrame(self).Show()
+class GeneticAlgorithmSolver:
+    def __init__(self, agv_positions, target_column, cargo_weight, shelf, max_layer=5):
+        self.agv_positions = agv_positions
+        self.target_column = target_column
+        self.cargo_weight = cargo_weight
+        self.shelf = shelf
+        self.max_layer = shelf.config.layers - 1
+        
+        # 遗传算法参数
+        self.pop_size = 50
+        self.elite_size = 10
+        self.mutation_rate = 0.2
+        self.generations = 100
 
+    def _init_population(self):
+        """修复种群初始化偏差"""
+        population = []
+        valid_positions = self._find_valid_positions()
+        if not valid_positions:
+            raise ValueError("当前货架在重量允许的层数范围内已无可用位置")
+            
+        layer_distribution = {z: [pos for pos in valid_positions if pos[2] == z] 
+                            for z in set(p[2] for p in valid_positions)}
+        
+        # 新增空分布检查
+        if not layer_distribution:
+            raise ValueError("所有符合条件的层都已满载")
+        
+        for _ in range(self.pop_size):
+            agv_id = np.random.randint(0, len(self.agv_positions))
+            # 按层数加权选择（高层优先）
+            weights = [z + 1 for z in layer_distribution.keys()]  # 高层获得更大权重
+            selected_layer = np.random.choice(list(layer_distribution.keys()), p=np.array(weights)/sum(weights))
+            x, _, z = layer_distribution[selected_layer][np.random.randint(0, len(layer_distribution[selected_layer]))]
+            population.append([agv_id, x, z])
+        return np.array(population, dtype=np.int32)
 
+    def _find_valid_positions(self):
+        """解除层数过滤限制"""
+        valid = []
+        full_layers = [z for z in range(self.shelf.config.layers) 
+                      if self.shelf.is_layer_full(z)]
+        
+        for z in range(self.shelf.config.layers):
+            if z in full_layers:
+                continue
+            # 移除层数过滤条件（原z > max_allowed_layer判断）
+            for x in range(self.shelf.config.rows):
+                for y in range(self.shelf.config.columns):
+                    if self.shelf.get_position_status(x, y, z) == 0:
+                        valid.append((x, y, z))
+        return valid
+
+    def _get_max_allowed_layer(self):
+        """优化重货层数降级策略"""
+        weight_ratio = self.cargo_weight / self.shelf.max_weight
+        base_layer = 0 if weight_ratio >= 0.8 else 1 if weight_ratio >= 0.6 else 2 if weight_ratio >= 0.4 else self.shelf.config.layers - 1
+        
+        # 修改点：解除重货向上搜索限制
+        search_range = range(0, self.shelf.config.layers)  # 始终从底层开始搜索
+        
+        for z in search_range:
+            # 保留基础层限制但允许向上扩展
+            if weight_ratio >= 0.4 and z > (base_layer + 1):  # 允许扩展到次高层
+                continue
+            if not self.shelf.is_layer_full(z):
+                return z
+        
+        # 基础层满时强制扩展到允许的最高层
+        for z in range(base_layer + 1, self.shelf.config.layers):
+            if not self.shelf.is_layer_full(z):
+                return z
+        return base_layer  # 触发错误
+    def _fitness(self, individual):
+        agv_id, x, z = individual
+        original_col = self.agv_positions[agv_id]
+        
+        time_cost = (abs(3 - original_col) + abs(self.target_column - 3)) * 10
+        
+        # 动态计算理想层数（新增重量感知系数）
+        weight_ratio = self.cargo_weight / self.shelf.max_weight
+        ideal_layer = 0 if weight_ratio >= 0.8 else \
+                     self.shelf.config.layers - 1 if weight_ratio < 0.2 else z
+        layer_penalty = abs(z - ideal_layer) * (1000 if weight_ratio >=0.4 else 500)
+        
+        return -(time_cost + layer_penalty)
+    def _get_target_layer(self):
+        """计算重量对应的理想层数"""
+        weight_ratio = self.cargo_weight / self.shelf.max_weight
+        # 分层映射规则（可根据需求调整）
+        if weight_ratio >= 0.8:   return 0
+        elif weight_ratio >= 0.6: return 1
+        elif weight_ratio >= 0.4: return 2
+        elif weight_ratio >= 0.2: return 3
+        else:                    return 4
+    def _rank(self, population):
+        """增加多样性保护机制"""
+        graded = [(self._fitness(ind), ind) for ind in population]
+        sorted_pop = sorted(graded, key=lambda x: x[0], reverse=True)
+        
+        # 前10%直接保留
+        elite = [x[1] for x in sorted_pop[:int(self.pop_size*0.1)]]
+        
+        # 剩余90%进行多样性采样
+        remaining = sorted_pop[int(self.pop_size*0.1):]
+        z_values = [ind[2] for _, ind in remaining]
+        diversity_scores = [1/(z+1) + np.random.random()*0.1 for z in z_values]  # 鼓励高层
+        selected = [remaining[i][1] for i in np.argsort(diversity_scores)[::-1][:self.pop_size - len(elite)]]
+        
+        return elite + selected
+
+    def _mutate(self, individual):
+        """增强高层变异倾向"""
+        agv_id, x, z = individual
+        # 新增高层变异补偿机制
+        if z < 3 and np.random.random() < 0.6:  # 低层强制上移
+            z += np.random.randint(1, 4)
+        elif z >= 3 and np.random.random() < 0.4:
+            z += np.random.randint(-2, 3)
+        z = np.clip(z, 0, self.max_layer)
+        return [agv_id, x, z]
+
+    def _crossover(self, parent1, parent2):
+        """强化层数交叉逻辑"""
+        if np.random.random() < 0.5:
+            # 强制交叉层数基因
+            return [parent1[0], parent2[1], parent2[2]] if parent2[2] > parent1[2] else [parent2[0], parent1[1], parent1[2]]
+        else:
+            # 随机保留较高层的基因
+            return [parent2[0], parent1[1], max(parent1[2], parent2[2])]
+
+    def solve(self):
+        print("当前有效位置:", self._find_valid_positions())
+        print("初始种群层分布:", np.unique(self._init_population()[:,2], return_counts=True))  # 新增初始化分布监控
+        """执行遗传算法"""
+        pop = self._init_population()
+        
+        for _ in range(self.generations):
+            ranked = self._rank(pop)
+            elite = ranked[:self.elite_size]
+            
+            # 生成新一代
+            children = []
+            while len(children) < self.pop_size - self.elite_size:
+                # 修改点：将numpy数组索引转换为标量
+                selected = np.random.choice(len(ranked[:self.elite_size]), 2, replace=False)
+                p1 = ranked[:self.elite_size][selected[0]]
+                p2 = ranked[:self.elite_size][selected[1]]
+                
+                child = self._crossover(p1, p2)
+                child = self._mutate(child)
+                children.append(child)
+            
+            pop = np.vstack((elite, children))
+        
+        best = self._rank(pop)[0]
+        return best[0], (best[1], 0, best[2])
 class InputFrame(BaseFrame):
     def __init__(self, parent):
         super().__init__(parent, "货箱入库", (300, 500))
@@ -300,6 +474,9 @@ class InputFrame(BaseFrame):
                             raise
                 finally:
                     self.show_message(f"成功入库 {success} 条，失败 {failed} 条", "批量入库完成")
+                    # 新增刷新逻辑
+                    self.GetParent().draw_panel.Refresh(eraseBackground=True)
+                    self.GetParent().draw_panel.Update()
                     
         except Exception as e:
             self.show_message(f"批量入库失败: {str(e)}", "错误", wx.ICON_ERROR)
@@ -370,37 +547,99 @@ class ManualInputFrame(BaseFrame):
         except ValueError:
             self.show_message("无效的重量值", "错误", wx.ICON_ERROR)
             return
-
+        self._smart_inventory(inputs)
         # Database operations
-        with self.cargo_mgr.db.db_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("SELECT id FROM cargo WHERE id=?", (inputs["id"],))
-                if cursor.fetchone():
-                    raise ValueError("货箱ID已存在")
+        # with self.cargo_mgr.db.db_connection() as conn:
+        #     cursor = conn.cursor()
+        #     try:
+        #         cursor.execute("SELECT id FROM cargo WHERE id=?", (inputs["id"],))
+        #         if cursor.fetchone():
+        #             raise ValueError("货箱ID已存在")
 
-                shelf = self.cargo_mgr.get_airline_shelf(inputs["airline"])
-                pos = shelf.find_available_position()
-                if not pos:
-                    raise ValueError("货架已满")
+        #         shelf = self.cargo_mgr.get_airline_shelf(inputs["airline"])
+        #         pos = shelf.find_available_position()
+        #         if not pos:
+        #             raise ValueError("货架已满")
 
-                shelf.modify_position(*pos, 1)
-                position_str = f"{pos[0]}-{self.cargo_mgr.airline_row_mapping[inputs['airline']]}-{pos[2]}"
-                time_label=time.strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute("INSERT INTO cargo VALUES (?,?,?,?,?)", (
-                    inputs["id"],
-                    inputs["airline"],
-                    time_label,
-                    weight,
-                    position_str
-                ))
-                conn.commit()
-                self.show_message("入库成功！\n \n详情信息：\n \n货箱ID：%s\n航空公司：%s\n入库时间:%s\n重量：%d kg\n位置:%s行%s列%s层\n"%(inputs["id"],inputs["airline"],time_label,weight,position_str[0],position_str[2],position_str[4]), "提示")
-                self.Close()
+        #         shelf.modify_position(*pos, 1)
+        #         position_str = f"{pos[0]}-{self.cargo_mgr.airline_row_mapping[inputs['airline']]}-{pos[2]}"
+        #         time_label=time.strftime('%Y-%m-%d %H:%M:%S')
+        #         cursor.execute("INSERT INTO cargo VALUES (?,?,?,?,?)", (
+        #             inputs["id"],
+        #             inputs["airline"],
+        #             time_label,
+        #             weight,
+        #             position_str
+        #         ))
+        #         conn.commit()
+        #         self.show_message("入库成功！\n \n详情信息：\n \n货箱ID：%s\n航空公司：%s\n入库时间:%s\n重量：%d kg\n位置:%s行%s列%s层\n"%(inputs["id"],inputs["airline"],time_label,weight,position_str[0],position_str[2],position_str[4]), "提示")
+        #         self.Close()
+        #         # 新增刷新逻辑
+        #         self.GetParent().GetParent().draw_panel.Refresh(eraseBackground=True)
+        #         self.GetParent().GetParent().draw_panel.Update()
+        #     except Exception as e:
+        #         self.show_message(str(e), "错误", wx.ICON_ERROR)
+    def _smart_inventory(self, inputs):
+            """智能入库核心逻辑"""
+            with self.cargo_mgr.db.db_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    # 获取AGV位置
+                    cursor.execute("SELECT position FROM agv")
+                    agv_positions = [row[0] for row in cursor.fetchall()]
+                    
+                    # 获取目标货架
+                    shelf = self.cargo_mgr.get_airline_shelf(inputs["airline"])
+                    # 替换原有位置查找逻辑
+                    pos = shelf.find_available_position()
+                    if not pos:
+                        raise ValueError("货架所有层已满")
 
-            except Exception as e:
-                self.show_message(str(e), "错误", wx.ICON_ERROR)
-
+                    target_column = self.cargo_mgr.airline_row_mapping[inputs["airline"]]
+                    
+                    # 运行遗传算法
+                    solver = GeneticAlgorithmSolver(
+                        agv_positions=agv_positions,
+                        target_column=target_column,
+                        cargo_weight=int(inputs["weight"]),
+                        shelf=shelf
+                    )
+                    agv_id, position = solver.solve()
+                    
+                    # 更新货架和AGV位置
+                    shelf.modify_position(*position, 1)
+                    # 修复点1：添加参数类型转换
+                    cursor.execute("UPDATE agv SET position=? WHERE rowid=?", 
+                                (int(target_column), int(agv_id)))  # 显式转换为整数
+                    conn.commit()  # 立即提交AGV位置更新
+                    
+                    # 记录入库信息
+                    position_str = f"{position[0]}-{target_column}-{position[2]}"
+                    time_label = time.strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute("INSERT INTO cargo VALUES (?,?,?,?,?)", (
+                        inputs["id"], inputs["airline"], time_label,
+                        inputs["weight"], position_str
+                    ))
+                    
+                    conn.commit()
+                    # 修改点：使用已存在的show_message方法替代
+                    self.show_message(
+                        f"入库成功！\n货箱ID：{inputs['id']}\n"
+                        f"航空公司：{inputs['airline']}\n"
+                        f"调度AGV编号：{agv_id}\n"  # 新增AGV编号显示
+                        f"入库时间：{time_label}\n"
+                        f"重量：{inputs['weight']}kg\n"
+                        f"位置：{position_str}",
+                        "提示"
+                    )
+                    
+                    # 刷新界面
+                    self.Close()
+                    self.GetParent().GetParent().draw_panel.Refresh(eraseBackground=True)
+                    self.GetParent().GetParent().draw_panel.Update()
+                    
+                except Exception as e:
+                    self.show_message(str(e), "错误", wx.ICON_ERROR)
 # class InventoryViewFrame(BaseFrame):
 #     def __init__(self, parent):
 #         super().__init__(parent, title="库存数据", size=(400, 300))
@@ -433,6 +672,7 @@ class ManualInputFrame(BaseFrame):
 class InventoryViewFrame(BaseFrame):
     def __init__(self, parent):
         super().__init__(parent, title="库存视图", size=(1500, 800))
+        self.agv_buttons = {}  # 新增：存储AGV按钮的字典
         self.current_layer = 0  # 默认显示第0层
         self.cell_size = 40     # 单元格大小
         self.padding = 20       # 边距
@@ -448,7 +688,7 @@ class InventoryViewFrame(BaseFrame):
     def _init_ui(self):
         panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
-        
+
         # 库存可视化面板
         self.draw_panel = wx.Panel(panel)
         self.draw_panel.Bind(wx.EVT_PAINT, self.on_paint)
@@ -457,6 +697,15 @@ class InventoryViewFrame(BaseFrame):
         
         # 层数控制区域
         control_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        # 添加入库、出库按钮
+        inventory_btn = wx.Button(panel, label="入库")
+        inventory_btn.Bind(wx.EVT_BUTTON, self.on_inventory)
+        control_sizer.Add(inventory_btn, 0, wx.ALIGN_CENTER | wx.RIGHT, 5)
+        
+        out_btn = wx.Button(panel, label="出库")
+        out_btn.Bind(wx.EVT_BUTTON, self.on_inventory_out)
+        control_sizer.Add(out_btn, 0, wx.ALIGN_CENTER | wx.RIGHT, 10)
+        
         control_sizer.Add(wx.StaticText(panel, label="输入层数:"), 0, wx.ALIGN_CENTER | wx.RIGHT, 5)
         
         self.layer_input = wx.TextCtrl(panel, value=str(self.current_layer), style=wx.TE_PROCESS_ENTER)
@@ -469,7 +718,12 @@ class InventoryViewFrame(BaseFrame):
         
         main_sizer.Add(control_sizer, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
         panel.SetSizer(main_sizer)
-
+    def on_inventory(self, event):
+        """打开入库界面，与主界面功能一致"""
+        InputFrame(self).Show()
+    def on_inventory_out(self, event):
+        """打开出库界面，与主界面功能一致"""
+        InventoryOutFrame(self).Show()
     def on_layer_change(self, event):
         """处理层数变化事件"""
         try:
@@ -485,6 +739,8 @@ class InventoryViewFrame(BaseFrame):
     def on_paint(self, event):
         dc = wx.PaintDC(self.draw_panel)
         dc.Clear()
+        # 获取AGV位置数据
+        agv_positions = self._get_agv_positions()
         # 动态计算字体大小
         max_name_length = max(len(airline) for airline, _ in self.cargo_mgr.airline_shelves.items())
         font_size = max(8, 14 - int(max_name_length * 0.6))  # 根据最长名称动态调整字号（8-14之间）
@@ -511,6 +767,7 @@ class InventoryViewFrame(BaseFrame):
             label_x = x_pos + (shelf_width - text_width) // 2
             dc.DrawText(f"{airline}", label_x, y_pos)
             self._draw_shelf(dc, shelf, x_pos, y_pos + self.label_gap)
+        self._draw_agv_locations(dc, agv_positions, start_x, start_y)
 
     def _calculate_shelf_height(self, shelf):
         return shelf.config.rows * (self.cell_size + 5) + 40  # 底部间距从20加大到40
@@ -524,7 +781,109 @@ class InventoryViewFrame(BaseFrame):
                 dc.DrawText(symbol, 
                           start_x + col * (self.cell_size + 5),
                           start_y + row * (self.cell_size + 5))
+    def _get_agv_positions(self):
+        """从数据库获取AGV位置信息"""
+        with self.cargo_mgr.db.db_connection() as conn:
+            cursor = conn.cursor()
+            # 修改点：添加排序保证数据一致性
+            cursor.execute("SELECT position FROM agv ORDER BY rowid")  # 按rowid排序
+            return [row[0] for row in cursor.fetchall()]
 
+    def _draw_agv_locations(self, dc, positions, start_x, start_y):
+        """绘制AGV位置指示箭头"""
+        shelf_width = (self.cell_size + 5) * ShelfConfig().columns
+        font = wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+        dc.SetFont(font)
+        
+        airlines = list(self.cargo_mgr.airline_shelves.items())
+        for index, (airline, shelf) in enumerate(airlines):
+            row = index // self.columns_per_row
+            col = index % self.columns_per_row
+            
+            x_pos = start_x + col * (shelf_width + self.horizontal_gap)
+            y_pos = start_y + row * (self._calculate_shelf_height(shelf) + self.vertical_gap) + self.label_gap
+            
+            # 在货架底部下方绘制AGV指示
+            base_y = y_pos + self._calculate_shelf_height(shelf) + 10
+            for pos in positions:
+                if pos == self.cargo_mgr.airline_row_mapping[airline]:
+                    dc.DrawText("↑", x_pos + shelf_width//2 - 8, base_y)  # 恢复箭头绘制
+        
+        # 然后管理按钮
+        self._manage_agv_buttons(positions, start_x, start_y)
+    def _manage_agv_buttons(self, positions, start_x, start_y):
+        """管理AGV按钮的创建和销毁"""
+        # 先销毁所有旧按钮
+        for btn_pair in self.agv_buttons.values():
+            btn_left, btn_right = btn_pair
+            btn_left.Destroy()
+            btn_right.Destroy()
+        self.agv_buttons.clear()
+
+    # 创建新按钮
+        shelf_width = (self.cell_size + 5) * ShelfConfig().columns
+        airlines = list(self.cargo_mgr.airline_shelves.items())
+        
+        for index, (airline, shelf) in enumerate(airlines):
+            row = index // self.columns_per_row
+            col = index % self.columns_per_row
+            x_pos = start_x + col * (shelf_width + self.horizontal_gap)
+            y_pos = start_y + row * (self._calculate_shelf_height(shelf) + self.vertical_gap) + self.label_gap
+            base_y = y_pos + self._calculate_shelf_height(shelf) + 10
+
+            for pos in positions:
+                if pos == self.cargo_mgr.airline_row_mapping[airline]:
+                    btn_x = x_pos + shelf_width//2 - 25
+                    btn_y = base_y + 20
+                    
+                    # 修复1：使用Partial绑定事件避免闭包问题
+                    from functools import partial
+                    
+                    # 修复2：强制设置按钮可见性
+                    btn_left = wx.Button(self.draw_panel, -1, "←", pos=(btn_x-30, btn_y))
+                    btn_right = wx.Button(self.draw_panel, -1, "→", pos=(btn_x+30, btn_y))
+                    btn_left.Show()
+                    btn_right.Show()
+                    
+                    # 修复3：使用WeakRef避免内存泄漏
+                    btn_left.Bind(wx.EVT_BUTTON, partial(self.on_agv_move, pos=pos, direction=-1))
+                    btn_right.Bind(wx.EVT_BUTTON, partial(self.on_agv_move, pos=pos, direction=1))
+                    
+                    # 修复4：强制刷新整个布局
+                    self.agv_buttons[pos] = (btn_left, btn_right)
+        
+        # 新增布局刷新
+        self.draw_panel.Layout()
+        self.draw_panel.Update()
+    def on_agv_move(self, event, pos, direction):
+        """统一处理AGV移动事件"""
+        self.move_agv(pos, direction)
+    def move_agv(self, current_pos, direction):
+        new_pos = current_pos + direction
+        
+        # 修改边界检查逻辑
+        max_column = len(self.cargo_mgr.airline_shelves) - 1  # 获取实际航空公司数量
+        if new_pos < 0 or new_pos > max_column:
+            self.show_message(f"无法移动，有效位置范围0-{max_column}", "警告", wx.ICON_WARNING)
+            return
+            
+        # 检查碰撞
+        with self.cargo_mgr.db.db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT position FROM agv WHERE position=?", (new_pos,))
+            if cursor.fetchone():
+                self.show_message("移动失败：即将与其他AGV发生碰撞！", "警告", wx.ICON_WARNING)
+                return
+        # 更新数据库
+        try:
+            with self.cargo_mgr.db.db_connection() as conn:
+                conn.execute("UPDATE agv SET position=? WHERE position=?", (new_pos, current_pos))
+                conn.commit()
+            # 修复5：强制完整刷新界面
+            self.draw_panel.Refresh(eraseBackground=True)
+            self.draw_panel.Update()
+        except sqlite3.Error as e:
+            self.show_message(f"数据库更新失败: {str(e)}", "错误", wx.ICON_ERROR)
     def on_mouse_motion(self, event):
         """处理鼠标悬停事件"""
         pos = event.GetPosition()
@@ -980,6 +1339,9 @@ class InventoryOutFrame(BaseFrame):
                 conn.commit()
             self.show_message("全部货箱已成功出库", "操作成功")
             self.Close()
+            # 新增刷新逻辑
+            self.GetParent().draw_panel.Refresh(eraseBackground=True)
+            self.GetParent().draw_panel.Update()
         except Exception as e:
             self.show_message(f"出库失败: {str(e)}", "错误", wx.ICON_ERROR)
 
@@ -1026,6 +1388,9 @@ class Out_on_id(BaseFrame):
                 shelf.modify_position(x,0,z,0)
                 self.show_message("出库成功", "提示")
                 self.Close()
+                # 新增刷新逻辑
+                self.GetParent().GetParent().draw_panel.Refresh(eraseBackground=True)
+                self.GetParent().GetParent().draw_panel.Update()
             else:
                 self.show_message("ID对应的货箱不存在！", "提示")
 
@@ -1072,6 +1437,9 @@ class Out_on_airline(BaseFrame):
                 conn.commit()
                 self.show_message("出库成功", "提示")
                 self.Close()
+                # 新增刷新逻辑
+                self.GetParent().GetParent().draw_panel.Refresh(eraseBackground=True)
+                self.GetParent().GetParent().draw_panel.Update()
             else :
                 self.show_message("航空公司对应的货箱不存在！", "提示")
 if __name__ == "__main__":
